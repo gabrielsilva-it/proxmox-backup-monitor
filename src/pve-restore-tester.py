@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pve-restore-tester.py (v1.3) - testa automaticamente os backups do NAS.
+"""pve-restore-tester.py (v1.4) - testa automaticamente os backups do NAS.
 
 Roda no pve3. Monta os backups dos Proxmox (pve1, pve2, pve3) SOMENTE LEITURA, descobre sozinho
 cada VM que tem backup e testa o backup mais recente de cada uma:
@@ -16,6 +16,8 @@ As tags vem da copia do estado de cada host no NAS (pve-backup-status.json).
 VM de teste: sempre VMID 9000-9099 (livre em TODO o cluster), nome rt-<vmid>, SEM placa de rede
 (protecao desligada, CPU hotplug/NUMA/afinidade/hookscript/args removidos antes de ligar).
 Escolhe sozinho a VM mais atrasada (nunca testadas primeiro) e so trabalha na janela configurada.
+Trava de backup (v1.4): nao comeca teste enquanto ha backup em andamento (vzdump neste no, ou arquivo parcial sendo gravado no
+NAS) nem quando um job de backup deste no comecaria antes do teste terminar. Espera o backup passar e continua na mesma noite.
 Resultado em /var/lib/pve-backup-monitor/tests.json (o agent2 do Zabbix le este arquivo).
 
 Uso:
@@ -23,7 +25,8 @@ Uso:
   --plan                        mostra o que seria testado agora (nao testa nada)
   --status                      tabela do ultimo teste de cada VM
   --run                         testa o que estiver devido, dentro da janela (cron)
-  --run --only HOST/VMID --level integrity|restore [--force-window]   teste manual de uma VM
+  --run --only HOST/VMID --level integrity|restore [--force-window] [--sem-guarda]   teste manual de uma VM
+                                (--sem-guarda ignora a trava de backup em andamento)
   --refresh                     regrava tests.json a partir do estado (cron a cada 5 min)
   --install                     cria pastas, configuracao padrao e agendamento no cron
 """
@@ -78,6 +81,13 @@ DEFAULTS = {
     "max_backup_age_days": 40,
     "overdue_days": 35,
     "nas_read_mb_s": 80,
+    "guard": {
+        "enabled": True,
+        "margin_min": 20,           # nao comeca teste que acabaria menos de 20 min antes de um job de backup deste no
+        "poll_seconds": 120,        # enquanto espera o backup acabar, olha de novo a cada 2 min
+        "max_wait_min": 300,        # espera no maximo 5 h por vez (a janela de testes tambem limita)
+        "partial_minutes": 30,      # arquivo parcial (.dat/.tmp) do NAS mexido ha menos que isso = backup sendo gravado
+    },
     "restore": {
         "enabled": False,
         "vmid_min": 9000, "vmid_max": 9099,
@@ -395,6 +405,146 @@ def pack_nights(plan, cfg, night_secs):
         nights.append(today)
         pending = rest
     return nights, []
+
+
+# ------------------------------------------------------------------ trava de backup em andamento
+# Regra: nao comeca teste enquanto ha backup acontecendo (vzdump neste no, ou arquivo parcial sendo gravado no NAS) nem
+# quando um job de backup deste no vai comecar antes do teste terminar. Espera o backup passar e continua na mesma noite.
+_AVISADOS = set()
+
+
+def _json_list(text):
+    try:
+        v = json.loads(text)
+    except ValueError:
+        return None
+    return v if isinstance(v, list) else None
+
+
+def backup_running(runner, cfg, node, srcs, now):
+    """Texto com o motivo se ha backup em andamento agora; "" se nao ha. Nunca levanta excecao."""
+    g = cfg["guard"]
+    why = []
+    rc, out, _ = runner.run(["pvesh", "get", "/nodes/%s/tasks" % node, "--source", "active", "--output-format", "json"], 60)
+    tasks = _json_list(out) if rc == 0 else None
+    if tasks is not None:
+        vz = [x for x in tasks if isinstance(x, dict) and x.get("type") == "vzdump"]
+        if vz:
+            ids = [str(x["id"]) for x in vz if x.get("id")]
+            why.append("vzdump em execucao neste no (%s)" % (("VM " + ",".join(ids[:4])) if ids else "job com varias VMs"))
+    elif runner.run(["pgrep", "-f", "task UPID.*:vzdump:"], 15)[0] == 0:      # plano B se o pvesh nao responder
+        why.append("vzdump em execucao neste no")
+    limit = now - g["partial_minutes"] * 60
+    for host, src in sorted((srcs or {}).items()):
+        try:
+            names = os.listdir(src["dump"])
+        except OSError:
+            continue
+        for n in names:
+            if n.startswith("vzdump-") and n.endswith((".dat", ".tmp", ".partial")):
+                try:
+                    if os.stat(os.path.join(src["dump"], n)).st_mtime >= limit:
+                        why.append("backup sendo gravado no NAS (%s: %s)" % (host, n[:48]))
+                        break
+                except OSError:
+                    pass
+    return "; ".join(why)
+
+
+def jobs_next(runner, node, now, log=None):
+    """Proximo inicio de cada job de backup ATIVO deste no: [(epoch, 'job ID (agenda)')] em ordem. A agenda e calculada
+    pelo systemd-analyze, que entende a mesma sintaxe do Proxmox (sat 01:00, *-*-01 02:00, mon..fri 21:00 ...)."""
+    rc, out, _ = runner.run(["pvesh", "get", "/cluster/backup", "--output-format", "json"], 60)
+    jobs = _json_list(out) if rc == 0 else None
+    res = []
+    for j in jobs or []:
+        if not isinstance(j, dict) or str(j.get("enabled", 1)).lower() in ("0", "false", "no"):
+            continue
+        if j.get("node") and j["node"] != node:
+            continue
+        sched = j.get("schedule")
+        if not sched and j.get("starttime"):                  # formato antigo (dow + starttime)
+            sched = ("%s %s" % (j["dow"], j["starttime"])) if j.get("dow") else str(j["starttime"])
+        if not sched:
+            continue
+        rc, out, _ = runner.run(["systemd-analyze", "calendar", "--iterations=1", str(sched)], 30)
+        m = re.search(r"Next elapse:\s+(?:[A-Za-z]{3}\s+)?(\d{4})-(\d\d)-(\d\d)\s+(\d\d):(\d\d):(\d\d)", out) if rc == 0 else None
+        if not m:
+            if log and sched not in _AVISADOS:
+                _AVISADOS.add(sched)
+                log("guarda: nao consegui interpretar a agenda '%s' do job %s (a trava so enxerga vzdump em andamento nele)" % (
+                    sched, j.get("id", "?")))
+            continue
+        ts = datetime.datetime(*[int(x) for x in m.groups()]).timestamp()
+        if ts > now:
+            res.append((ts, "job %s (%s)" % (j.get("id", "?"), sched)))
+    return sorted(res)
+
+
+def guard_status(runner, cfg, node, srcs, now, log=None):
+    nxt = jobs_next(runner, node, now, log)
+    return {"busy": backup_running(runner, cfg, node, srcs, now),
+            "next": nxt[0][0] if nxt else None, "next_desc": nxt[0][1] if nxt else ""}
+
+
+def guard_wait(runner, cfg, log, node, srcs, now_fn, sleep, gstate, force_window):
+    """Espera enquanto ha backup em andamento ou um job deste no esta prestes a comecar (ate margin_min antes).
+    gstate["hold"] guarda ate quando segurar depois que um job estava para comecar (o job demora uns segundos para aparecer).
+    Devolve (continuar, proximo_inicio_de_job, descricao); continuar=False encerra a rodada de hoje."""
+    g = cfg["guard"]
+    margin, slept, said = g["margin_min"] * 60, 0, False
+    while True:
+        now = now_fn()
+        gs = guard_status(runner, cfg, node, srcs, now, log)
+        nxt = gs["next"]
+        if gs["busy"]:
+            why = gs["busy"]
+        elif nxt and nxt - now <= margin:
+            why = "%s comeca em %d min" % (gs["next_desc"], max(0, int(nxt - now) // 60))
+            gstate["hold"] = max(gstate["hold"], nxt + 300)
+        elif now < gstate["hold"]:
+            why = "aguardando o job de backup que esta comecando"
+        else:
+            if said:
+                log("guarda: liberado depois de %d min de espera" % (slept // 60))
+            return True, nxt, gs["next_desc"]
+        if not said:
+            log("guarda: %s - testes em pausa" % why)
+            said = True
+        if not force_window:
+            rem = window_remaining(datetime.datetime.fromtimestamp(now), cfg["window"])
+            if rem is None or rem < 900:
+                log("guarda: a janela esta acabando; o que falta fica para a proxima noite")
+                return False, nxt, gs["next_desc"]
+        if slept >= g["max_wait_min"] * 60:
+            log("guarda: espera passou de %d min, encerrando a rodada" % g["max_wait_min"])
+            return False, nxt, gs["next_desc"]
+        sleep(g["poll_seconds"])
+        slept += g["poll_seconds"]
+
+
+def guard_report(runner, cfg, node, now):
+    """Linhas do --check sobre a trava (para conferir no pve3 que as duas leituras funcionam)."""
+    g = cfg["guard"]
+    if not g.get("enabled", True):
+        return ["  DESLIGADA na configuracao (guard.enabled = false)"]
+    out = []
+    rc, txt, err = runner.run(["pvesh", "get", "/nodes/%s/tasks" % node, "--source", "active", "--output-format", "json"], 60)
+    tasks = _json_list(txt) if rc == 0 else None
+    if tasks is None:
+        out.append("  tarefas ativas: NAO CONSEGUI LER (%s) - usando o plano B (pgrep)" % ((err or "").strip()[:80] or "codigo %s" % rc))
+    else:
+        out.append("  tarefas ativas do no: %d, das quais %d de backup (vzdump)" % (
+            len(tasks), sum(1 for x in tasks if isinstance(x, dict) and x.get("type") == "vzdump")))
+    jobs = jobs_next(runner, node, now, lambda m: out.append("  " + m))
+    for ts, desc in jobs:
+        out.append("  proximo inicio: %s em %s" % (desc, time.strftime("%d/%m/%Y %H:%M", time.localtime(ts))))
+    if not jobs:
+        out.append("  nenhum job de backup ativo e agendado lido neste no")
+    out.append("  regra: nao comeca teste que acabaria menos de %d min antes de um job; se um backup esta rodando, espera (olha a cada %d s, ate %d min por vez)" % (
+        g["margin_min"], g["poll_seconds"], g["max_wait_min"]))
+    out.append("  arquivos parciais (.dat/.tmp) no NAS contam como backup em andamento se mexidos ha menos de %d min" % g["partial_minutes"])
+    return out
 
 
 # ------------------------------------------------------------------ teste de integridade
@@ -763,7 +913,8 @@ def write_report(inventory, state, cfg, now, node, out=OUT):
 
 # ------------------------------------------------------------------ execucao
 def run_tests(runner, cfg, log, now_fn=time.time, only=None, level=None, force_window=False, sleep=time.sleep,
-              mount=mount_sources, unmount=unmount_sources, state_path=STATE, inv_path=INVENTORY, out=OUT, hist=HISTORY):
+              mount=mount_sources, unmount=unmount_sources, state_path=STATE, inv_path=INVENTORY, out=OUT, hist=HISTORY,
+              use_guard=True):
     node = socket.gethostname().split(".")[0]
     state = load_json(state_path, None) or new_state()
     srcs, errs = mount(runner, cfg, log)
@@ -778,6 +929,8 @@ def run_tests(runner, cfg, log, now_fn=time.time, only=None, level=None, force_w
         touch_inventory(state, inventory, now_fn())
         state["cleanup_pending"] = sweep_leftovers(runner, cfg, log)
         done, restores, attempted, summary = 0, 0, set(), "none"
+        g_on = use_guard and cfg["guard"].get("enabled", True)
+        gstate, holds = {"hold": 0}, 0
         while True:
             now = now_fn()
             remaining = None
@@ -786,6 +939,17 @@ def run_tests(runner, cfg, log, now_fn=time.time, only=None, level=None, force_w
                 if remaining is None:
                     log("fora da janela de testes, encerrando")
                     break
+            nxt, ndesc = None, ""
+            if g_on:
+                go, nxt, ndesc = guard_wait(runner, cfg, log, node, srcs, now_fn, sleep, gstate, force_window)
+                if not go:
+                    break
+                now = now_fn()
+                if not force_window:
+                    remaining = window_remaining(datetime.datetime.fromtimestamp(now), cfg["window"])
+                    if remaining is None:
+                        log("fora da janela de testes, encerrando")
+                        break
             if only:
                 ent = [e for e in inventory if e["key"] == only]
                 if not ent:
@@ -794,17 +958,28 @@ def run_tests(runner, cfg, log, now_fn=time.time, only=None, level=None, force_w
                 plan = [{"entry": ent[0], "level": level or "integrity", "reason": "pedido manual"}]
             else:
                 plan = plan_tests(inventory, state, cfg, now)
-            item = None
+            room = remaining
+            if nxt:
+                lim = nxt - now - cfg["guard"]["margin_min"] * 60      # tempo ate o proximo job de backup deste no
+                room = lim if room is None else min(room, lim)
+            item, held = None, False
             for p in plan:
                 if p["entry"]["key"] in attempted:
                     continue
                 if p["level"] == "restore" and not only and restores >= cfg["restore"]["max_per_night"]:
                     p = dict(p, level="integrity")
-                if remaining is not None and estimate_seconds(p, cfg) > remaining - 300:
+                if room is not None and estimate_seconds(p, cfg) > room - 300:
+                    if remaining is None or estimate_seconds(p, cfg) <= remaining - 300:
+                        held = True        # cabe na janela, so nao cabe antes do proximo job de backup
                     continue
                 item = p
                 break
             if item is None:
+                if held and nxt and holds < 20:
+                    holds += 1
+                    gstate["hold"] = max(gstate["hold"], nxt + 300)
+                    log("guarda: os testes que faltam nao cabem antes do %s; esperando o backup passar" % ndesc)
+                    continue
                 break
             e = item["entry"]
             attempted.add(e["key"])
@@ -900,6 +1075,9 @@ def cmd_check(runner, cfg, log):
                 print("  %-12s PROBLEMA: %s" % (h, errs.get(h)))
     finally:
         unmount_sources(runner, cfg)
+    print("== trava de backup (nao testa durante backup nem pouco antes de um job)")
+    for line in guard_report(runner, cfg, socket.gethostname().split(".")[0], time.time()):
+        print(line)
     free = free_pool_gb(runner, cfg["restore"]["target_storage"])
     print("== espaco livre em %s (destino do restore de teste): %s" % (
         cfg["restore"]["target_storage"], ("%.0f GB" % free) if free is not None else "NAO ENCONTRADO - ajuste restore.target_storage"))
@@ -917,7 +1095,7 @@ CRON_TEXT = ("# gerado por pve-restore-tester.py --install\n"
 
 def main():
     ap = argparse.ArgumentParser()
-    for f in ("--check", "--plan", "--status", "--run", "--refresh", "--install", "--quiet", "--force-window"):
+    for f in ("--check", "--plan", "--status", "--run", "--refresh", "--install", "--quiet", "--force-window", "--sem-guarda"):
         ap.add_argument(f, action="store_true")
     ap.add_argument("--only")
     ap.add_argument("--level", choices=["integrity", "restore"])
@@ -991,7 +1169,7 @@ def main():
         if a.only and not a.level:
             print("use --level integrity|restore com --only")
             return 2
-        n = run_tests(runner, cfg, log, only=a.only, level=a.level, force_window=a.force_window)
+        n = run_tests(runner, cfg, log, only=a.only, level=a.level, force_window=a.force_window, use_guard=not a.sem_guarda)
         log("fim: %d teste(s) executado(s)" % n)
         return 0
     ap.print_help()

@@ -66,6 +66,7 @@ The JSON never contains `null` values (Zabbix treats them as invalid), so missin
 - **Restore:** restores into a temporary VM (VMID 9000-9099, name `rt-<vmid>`) **with no network card**, limited RAM, protection, hotplug and hookscripts removed. It boots the VM, checks that it really booted (uptime and disk reads), then destroys it.
 - Big VMs are restored at most once a week; failed restores are retried the next night; very large disks get integrity checks only, to protect target storage.
 - Which guests are tested is controlled by Proxmox **tags** (`testar` opts in, `sem-backup` opts out).
+- **Backup-aware guard:** it never tests while a backup is running (an active `vzdump` task on the node, or a partial `.dat`/`.tmp` file still being written on the share), and it skips any test that would still be running when the next local backup job starts. It waits for that job to finish and resumes the same night. Job start times come from `pvesh get /cluster/backup` + `systemd-analyze calendar`. Tune it under `guard` in the config; `--sem-guarda` bypasses it for a manual run, and `--check` prints what the guard sees (active tasks, next job start times).
 
 Restore is **disabled by default**. Turn it on in `/etc/pve-restore-tester.json` once integrity runs are clean.
 
@@ -124,7 +125,7 @@ Python 3 (stdlib only) · Proxmox VE (`pvesh`, `qm`, `vzdump`) · Zabbix 7.4 (ag
 Duas ferramentas em Python para Proxmox VE:
 
 - **Monitor de backup:** verifica a cada minuto se cada VM/CT tem backup em dia, conforme o agendamento do próprio job. Mostra o estado de cada guest (ok, falhou, atrasado, sem backup, sem job…) no Zabbix e no Grafana.
-- **Testador de restore:** à noite, restaura os backups em VMs temporárias **sem rede**, confere se ligam e depois apaga. Assim, o backup fica comprovado, não só presumido.
+- **Testador de restore:** à noite, restaura os backups em VMs temporárias **sem rede**, confere se ligam e depois apaga. Assim, o backup fica comprovado, não só presumido. Uma trava evita testar durante um backup em andamento ou pouco antes do próximo job: o testador espera o backup passar e continua na mesma noite.
 
 Os alertas abrem chamados automaticamente. Projeto usado em produção numa indústria com várias unidades; esta é uma versão genérica, sem dados da empresa.
 

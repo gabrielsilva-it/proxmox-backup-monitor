@@ -274,6 +274,17 @@ class FakeRunner:
                 return 1, "", "x"
             self.vms.pop(int(c[2]), None)
             return 0, "", ""
+        if c[0] == "pvesh" and c[1] == "get" and c[2].startswith("/nodes/") and c[2].endswith("/tasks"):    # trava de backup (v1.4)
+            tk = o.get("tasks", [])
+            return 0, json.dumps(tk() if callable(tk) else tk), ""
+        if c[:3] == ["pvesh", "get", "/cluster/backup"]:
+            jb = o.get("jobs", [])
+            return 0, json.dumps(jb() if callable(jb) else jb), ""
+        if c[0] == "systemd-analyze":
+            txt = o["calendar"](c[-1]) if o.get("calendar") else None
+            return (0, txt, "") if txt else (1, "", "Failed to parse calendar specification")
+        if c[0] == "pgrep":
+            return o.get("pgrep_rc", 1), "", ""
         if c[:3] == ["pvesh", "get", "/cluster/resources"]:
             return 0, json.dumps([{"vmid": v, "node": "outro-no"} for v in o.get("cluster_ids", [])] + [{"vmid": 101}, {"vmid": 3001}]), ""
         if c[0] == "pvesh":
@@ -524,7 +535,7 @@ os.remove(paths["state_path"])
 runner = FakeRunner()
 assert t.run_tests(runner, CFG, log, now_fn=lambda: noon, only="pve3/101", level="integrity", force_window=True, sleep=lambda s: None,
                    mount=fake_mount, unmount=lambda r, c: None, **paths) == 1
-assert len([c for c in runner.calls if isinstance(c, tuple)]) == 1 and "101" in json.dumps(runner.calls[-1])
+assert len([c for c in runner.calls if isinstance(c, tuple)]) == 1 and "101" in json.dumps([c for c in runner.calls if isinstance(c, tuple)][-1])
 # falha de integridade vira estado 'failed' e entra no relatorio
 os.remove(paths["state_path"])
 bad_runner = FakeRunner(pipe=lambda c, cap: ([0 if "vma" in c[0] else 1] * len(c), "", "erro de leitura", 1.0))
@@ -710,6 +721,161 @@ for content in ("password=S3nh@,com=sinais\n", "S3nh@,com=sinais\n"):          #
     assert "ro," in ms.opts and "vers=3.0" in ms.opts and ms.src == "//192.0.2.246/PROXMOX/pve1"
     assert not srcs_m and "usuario=proxmox dominio=EMB smb=3.0" in errs_m["pve1"] and "Permission denied" in errs_m["pve1"]
     assert not os.path.exists(t.CRED), "arquivo de credenciais tem que ser apagado"
+
+# ---------------------------------------------------------------- trava de backup em andamento (v1.4)
+assert CFG["guard"]["enabled"] and CFG["guard"]["margin_min"] == 20 and CFG["guard"]["poll_seconds"] == 120
+
+
+def ts(mo, d, h, mi, y=2026):
+    return datetime.datetime(y, mo, d, h, mi).timestamp()
+
+
+class Clk2:
+    """Relogio simulado: sleep() avanca o tempo."""
+    def __init__(self, start):
+        self.t = start
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def cal_for(clock, table):
+    """Simula 'systemd-analyze calendar': devolve a primeira data da tabela depois de 'agora' no formato real."""
+    def fn(sched):
+        for e in table.get(sched, []):
+            if e > clock.t:
+                return "  Original form: %s\nNormalized form: x\n    Next elapse: %s\n       (in UTC): y\n" % (
+                    sched, datetime.datetime.fromtimestamp(e).strftime("%a %Y-%m-%d %H:%M:%S -03"))
+        return None
+    return fn
+
+
+GCFG = t.json.loads(t.json.dumps(CFG))
+SRC_G = make_source("pxg", [("vzdump-qemu-150-2026_10_06-21_00_00.vma.zst", 1000)])
+
+# 1) backup_running: vzdump ativo, outra tarefa, pvesh fora do ar (plano B), arquivo parcial no NAS
+assert t.backup_running(FakeRunner(), GCFG, "pve3", {"pve3": SRC_G}, NOW) == ""
+rr = t.backup_running(FakeRunner(tasks=[{"type": "vzdump", "id": "3015"}, {"type": "qmstart", "id": "101"}]), GCFG, "pve3", {}, NOW)
+assert "vzdump" in rr and "3015" in rr
+assert "varias VMs" in t.backup_running(FakeRunner(tasks=[{"type": "vzdump", "id": ""}]), GCFG, "pve3", {}, NOW)
+assert t.backup_running(FakeRunner(tasks=[{"type": "qmstart", "id": "1"}, {"type": "qmrestore", "id": "9000"}]), GCFG, "pve3", {}, NOW) == ""
+
+
+class PveshDown(FakeRunner):
+    def run(self, cmd, timeout=120):
+        if cmd[0] == "pvesh":
+            self.calls.append(list(cmd))
+            return 1, "", "no quorum"
+        return FakeRunner.run(self, cmd, timeout)
+
+
+assert t.backup_running(PveshDown(pgrep_rc=0), GCFG, "pve3", {}, NOW) != ""
+assert t.backup_running(PveshDown(pgrep_rc=1), GCFG, "pve3", {}, NOW) == ""
+P_DAT = os.path.join(SRC_G["dump"], "vzdump-qemu-101-2026_10_06-21_30_00.vma.dat")
+open(P_DAT, "wb").write(b"x")
+os.utime(P_DAT, (NOW - 120, NOW - 120))
+assert "NAS" in t.backup_running(FakeRunner(), GCFG, "pve3", {"pve2": SRC_G}, NOW)
+os.utime(P_DAT, (NOW - 3 * 3600, NOW - 3 * 3600))
+assert t.backup_running(FakeRunner(), GCFG, "pve3", {"pve2": SRC_G}, NOW) == "", "arquivo parcial abandonado nao pode travar para sempre"
+os.remove(P_DAT)
+
+# 2) jobs_next: ativo/desativado, outro no, formato antigo (dow+starttime), agenda ilegivel (avisa uma vez)
+clk = Clk2(ts(11, 30, 23, 30))
+TABLE = {"*-*-01 02:00": [ts(12, 1, 2, 0), ts(1, 1, 2, 0, 2027)], "mon,tue 21:00": [ts(12, 1, 21, 0)], "sat 01:00": [ts(12, 5, 1, 0)]}
+JOBS = [{"id": "backup-m", "schedule": "*-*-01 02:00", "enabled": 1},
+        {"id": "backup-off", "schedule": "sat 01:00", "enabled": 0},
+        {"id": "backup-outro-no", "schedule": "sat 01:00", "enabled": 1, "node": "outro"},
+        {"id": "backup-velho", "starttime": "21:00", "dow": "mon,tue", "enabled": 1},
+        {"id": "backup-ruim", "schedule": "isso nao e agenda", "enabled": 1}]
+jr = FakeRunner(jobs=JOBS, calendar=cal_for(clk, TABLE))
+lg_j = []
+res_j = t.jobs_next(jr, "pve3", clk.t, lg_j.append)
+assert [d for _, d in res_j] == ["job backup-m (*-*-01 02:00)", "job backup-velho (mon,tue 21:00)"], res_j
+assert res_j[0][0] == ts(12, 1, 2, 0)
+assert any("nao consegui interpretar" in m and "isso nao e agenda" in m for m in lg_j)
+lg_j2 = []
+t.jobs_next(jr, "pve3", clk.t, lg_j2.append)
+assert not lg_j2, "o aviso de agenda ilegivel nao pode repetir a cada consulta"
+
+# 3) guard_wait
+clk = Clk2(T0 := ts(11, 30, 23, 30))
+lg = []
+go, nxt, desc = t.guard_wait(FakeRunner(), GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, True)
+assert go and nxt is None and clk.t == T0 and not lg                                # livre: nao espera nada
+clk = Clk2(T0)
+lg = []
+go, _, _ = t.guard_wait(FakeRunner(tasks=lambda: [{"type": "vzdump", "id": "3015"}] if clk.t < T0 + 600 else []),
+                        GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, True)
+assert go and T0 + 600 <= clk.t <= T0 + 720 and any("pausa" in m for m in lg) and any("liberado" in m for m in lg), (clk.t - T0, lg)
+clk = Clk2(T0)
+lg = []
+go, _, _ = t.guard_wait(FakeRunner(tasks=[{"type": "vzdump", "id": ""}]), GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, True)
+assert not go and clk.t - T0 >= 300 * 60 and any("espera passou" in m for m in lg)   # backup sem fim: desiste depois de 5 h
+clk = Clk2(ts(12, 1, 5, 50))
+lg = []
+go, _, _ = t.guard_wait(FakeRunner(tasks=[{"type": "vzdump", "id": "1"}]), GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, False)
+assert not go and any("janela esta acabando" in m for m in lg)                      # 10 min para o fim da janela: nao fica esperando
+T_JOB, T_END = ts(12, 1, 2, 0), ts(12, 1, 2, 40)
+clk = Clk2(ts(12, 1, 1, 45))
+lg = []
+jr = FakeRunner(jobs=[{"id": "backup-m", "schedule": "*-*-01 02:00", "enabled": 1}], calendar=cal_for(clk, TABLE),
+                tasks=lambda: [{"type": "vzdump", "id": "3015"}] if T_JOB <= clk.t < T_END else [])
+go, nxt, desc = t.guard_wait(jr, GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, True)
+assert go and T_END <= clk.t <= T_END + 120 and "comeca em" in lg[0], (clk.t, lg)  # job as 02:00: espera comecar, rodar e acabar
+clk = Clk2(ts(12, 1, 0, 0))
+go, nxt, desc = t.guard_wait(FakeRunner(jobs=[{"id": "backup-m", "schedule": "*-*-01 02:00", "enabled": 1}], calendar=cal_for(clk, TABLE)),
+                             GCFG, lg.append, "pve3", {}, clk, clk.sleep, {"hold": 0}, True)
+assert go and nxt == T_JOB and clk.t == ts(12, 1, 0, 0)                              # job so daqui a 2 h: segue e devolve a hora
+
+# 4) run_tests de ponta a ponta com a trava
+
+
+def fresh_state():
+    if os.path.exists(paths["state_path"]):
+        os.remove(paths["state_path"])
+
+
+fresh_state()
+clk = Clk2(NOW)
+LOG.clear()
+starts = []
+busy_until = NOW + 1200
+r1 = FakeRunner(pipe=lambda c, cap: (starts.append(clk.t), ([0] * len(c), "", "", 1.0))[1],
+                tasks=lambda: [{"type": "vzdump", "id": "150"}] if clk.t < busy_until else [])
+n1 = t.run_tests(r1, GCFG, log, now_fn=clk, sleep=clk.sleep, mount=fake_mount, unmount=lambda r_, c_: None, **paths)
+assert n1 == 6 and min(starts) >= busy_until and any("guarda" in m for m in LOG), (n1, starts)   # nada testado durante o backup
+
+fresh_state()
+clk = Clk2(NOW)
+LOG.clear()
+starts = []
+gc = t.json.loads(t.json.dumps(GCFG))
+gc["guard"]["margin_min"] = 5
+t_j = NOW + 360                                         # job comeca daqui a 6 min e roda ate NOW+1200
+tbl = {"x": [t_j, NOW + 30 * 86400]}
+r2 = FakeRunner(pipe=lambda c, cap: (starts.append(clk.t), ([0] * len(c), "", "", 1.0))[1],
+                jobs=[{"id": "backup-n", "schedule": "x", "enabled": 1}], calendar=cal_for(clk, tbl),
+                tasks=lambda: [{"type": "vzdump", "id": ""}] if t_j <= clk.t < NOW + 1200 else [])
+n2 = t.run_tests(r2, gc, log, now_fn=clk, sleep=clk.sleep, mount=fake_mount, unmount=lambda r_, c_: None, **paths)
+assert n2 == 6 and min(starts) >= NOW + 1200, (n2, [s_ - NOW for s_ in starts])   # nenhum teste cabia antes do job: esperou o job passar
+assert any("nao cabem antes do" in m for m in LOG)
+
+fresh_state()                                           # trava desligada (--sem-guarda ou guard.enabled=false): ignora backup rodando
+for kwargs, cfg_x in ((dict(use_guard=False), GCFG), (dict(), dict(GCFG, guard=dict(GCFG["guard"], enabled=False)))):
+    fresh_state()
+    r3 = FakeRunner(tasks=[{"type": "vzdump", "id": "1"}])
+    assert t.run_tests(r3, cfg_x, log, now_fn=lambda: NOW, sleep=lambda s: None, mount=fake_mount, unmount=lambda r_, c_: None, **paths, **kwargs) == 6
+    assert not any(isinstance(c, list) and c[:2] == ["pvesh", "get"] and "tasks" in c[2] for c in r3.calls), "trava desligada nao pode consultar tarefas"
+
+# 5) --check mostra o que a trava enxerga
+clk = Clk2(ts(11, 30, 23, 30))
+rep = "\n".join(t.guard_report(FakeRunner(jobs=JOBS[:1], calendar=cal_for(clk, TABLE), tasks=[{"type": "vzdump", "id": "1"}]), GCFG, "pve3", clk.t))
+assert "das quais 1 de backup" in rep and "01/12/2026 02:00" in rep and "20 min" in rep, rep
+assert "DESLIGADA" in t.guard_report(FakeRunner(), dict(GCFG, guard=dict(GCFG["guard"], enabled=False)), "pve3", clk.t)[0]
+print("trava de backup: OK")
 
 t.print_status(inv, s)
 print("TODOS OS TESTES DO TESTADOR PASSARAM")
